@@ -3,7 +3,7 @@
 Shared platform Go library (AWS/Cloudflare/Kubernetes/Vault utilities + core helpers).
 
 [![Conventional Commits](https://img.shields.io/badge/Conventional%20Commits-1.0.0-fe5196.svg?logo=conventionalcommits&logoColor=white)](https://www.conventionalcommits.org/)
-![Go](https://img.shields.io/badge/Go-1.24+-00ADD8?logo=go&logoColor=white)
+![Go](https://img.shields.io/badge/Go-1.25+-00ADD8?logo=go&logoColor=white)
 ![AWS](https://img.shields.io/badge/AWS-SDK-232F3E?logo=amazonaws&logoColor=white)
 ![Cloudflare](https://img.shields.io/badge/Cloudflare-API-F38020?logo=cloudflare&logoColor=white)
 ![Vault](https://img.shields.io/badge/Vault-KV%20v2-000000?logo=vault&logoColor=white)
@@ -15,8 +15,7 @@ Shared platform Go library (AWS/Cloudflare/Kubernetes/Vault utilities + core hel
 
 - [What this is](#what-this-is)
 - [Scope and non-goals](#scope-and-non-goals)
-- [Current status](#current-status)
-- [Planned packages](#planned-packages)
+- [Repository packages](#repository-packages)
 - [Behavior contract](#behavior-contract)
 - [Development](#development)
 - [Contributing](#contributing)
@@ -45,23 +44,15 @@ minimal, dependency-light platform helpers:
   - Infrastructure-as-code generation/deployment logic
   - Wrapping entire provider SDK surfaces
 
-## Current status
+## Repository packages
 
-This repository is bootstrapped and currently documentation-first.
-Initial package scaffolding and implementation are planned next.
-
-## Planned packages
-
-- `internal/httpx`
-  - Shared retry/backoff + HTTP transport helpers
-- `cloudflare`
-  - API client with bounded retries and pagination support
-- `vault`
-  - KV v2 helpers (`ReadKVv2`, `WriteKVv2`)
-- `awsx`
-  - AWS SDK client/session utilities (STS account ID, assume-role helpers)
-- `kubernetes` (optional)
-  - Thin wrapper for kubeconfig/in-cluster client setup
+- **Implemented now**
+  - `internal/httpx`: Shared retry/backoff and HTTP client helpers
+  - `cloudflare`: API client with bounded retries and `ZoneIDByName`
+  - `vault`: KV v2 client helpers (`ReadKVv2`, `WriteKVv2`)
+  - `awsx`: AWS config factory with region validation and STS helpers
+- **Planned next**
+  - `kubernetes` (optional): Thin wrapper for kubeconfig/in-cluster client setup
 
 ## Behavior contract
 
@@ -91,7 +82,10 @@ go mod tidy
 ```bash
 go test ./...
 go test -race ./...
-gofmt -w .
+gofmt -s -w .
+go vet ./...
+staticcheck ./...
+govulncheck ./...
 ```
 
 If `golangci-lint` is configured in this repo:

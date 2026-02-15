@@ -22,5 +22,8 @@
 - Commands run locally:
   - `go test ./...`
   - `go test -race ./...`
-  - `gofmt -w .`
+  - `gofmt -s -w .`
+  - `go vet ./...`
+  - `staticcheck ./...`
+  - `govulncheck ./...`
   - `golangci-lint run` (if configured)
