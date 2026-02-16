@@ -1,0 +1,33 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+._*
+
+# Editors
+.idea/
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+!.vscode/*.code-snippets
+.history/
+*.code-workspace
+
+# Go
+bin/
+dist/
+tmp/
+vendor/
+*.test
+*.out
+coverage.out
+*.coverprofile
+
+# Environment
+.env
+
+# Project-local scratch / notes
+extras/
