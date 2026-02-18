@@ -3,11 +3,12 @@ package cloudflare
 import (
 	"bytes"
 	"context"
+	crand "crypto/rand"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"math/rand"
 	"net/http"
 	"net/url"
 	"os"
@@ -19,7 +20,8 @@ import (
 )
 
 const (
-	defaultBaseURL           = "https://api.cloudflare.com/client/v4"
+	defaultBaseURL = "https://api.cloudflare.com/client/v4"
+	// #nosec G101 -- environment variable key, not a credential value.
 	defaultTokenEnv          = "CLOUDFLARE_API_TOKEN"
 	defaultMaxRetriesEnv     = "CLOUDFLARE_HTTP_MAX_RETRIES"
 	defaultRetryBaseDelayEnv = "CLOUDFLARE_HTTP_RETRY_BASE_DELAY_SECONDS"
@@ -44,6 +46,13 @@ type Config struct {
 
 // Option configures Client construction behavior.
 type Option func(*Config)
+
+// RequestOption configures single-request execution behavior.
+type RequestOption func(*requestConfig)
+
+type requestConfig struct {
+	retryUnsafeMethods bool
+}
 
 // WithBaseURL overrides the default Cloudflare API base URL.
 func WithBaseURL(baseURL string) Option {
@@ -72,6 +81,13 @@ func WithRetries(maxRetries int, baseDelay, maxDelay time.Duration) Option {
 		cfg.MaxRetries = maxRetries
 		cfg.RetryBaseDelay = baseDelay
 		cfg.RetryMaxDelay = maxDelay
+	}
+}
+
+// WithRetryUnsafeMethods allows retries for non-idempotent methods on this request.
+func WithRetryUnsafeMethods() RequestOption {
+	return func(cfg *requestConfig) {
+		cfg.retryUnsafeMethods = true
 	}
 }
 
@@ -165,39 +181,96 @@ func (c *Client) Do(
 	requestBody any,
 	out any,
 ) error {
-	targetURL, err := c.buildURL(endpoint, params)
+	return c.DoWithOptions(ctx, method, endpoint, params, requestBody, out)
+}
+
+// DoWithOptions executes a Cloudflare API request and unmarshals result into out.
+func (c *Client) DoWithOptions(
+	ctx context.Context,
+	method string,
+	endpoint string,
+	params url.Values,
+	requestBody any,
+	out any,
+	reqOpts ...RequestOption,
+) error {
+	env, err := c.doEnvelope(ctx, method, endpoint, params, requestBody, reqOpts...)
 	if err != nil {
 		return err
+	}
+
+	if out == nil || len(env.Result) == 0 || string(env.Result) == "null" {
+		return nil
+	}
+
+	if err := json.Unmarshal(env.Result, out); err != nil {
+		return fmt.Errorf("decode cloudflare result: %w", err)
+	}
+
+	return nil
+}
+
+// Raw executes a Cloudflare API request against an arbitrary endpoint.
+func (c *Client) Raw(
+	ctx context.Context,
+	method string,
+	endpoint string,
+	params url.Values,
+	requestBody any,
+	out any,
+	reqOpts ...RequestOption,
+) error {
+	return c.DoWithOptions(ctx, method, endpoint, params, requestBody, out, reqOpts...)
+}
+
+func (c *Client) doEnvelope(
+	ctx context.Context,
+	method string,
+	endpoint string,
+	params url.Values,
+	requestBody any,
+	reqOpts ...RequestOption,
+) (*envelope, error) {
+	targetURL, err := c.buildURL(endpoint, params)
+	if err != nil {
+		return nil, err
 	}
 
 	var payload []byte
 	if requestBody != nil {
 		payload, err = json.Marshal(requestBody)
 		if err != nil {
-			return fmt.Errorf("marshal request body: %w", err)
+			return nil, fmt.Errorf("marshal request body: %w", err)
 		}
 	}
+
+	cfg := requestConfig{}
+	for _, opt := range reqOpts {
+		opt(&cfg)
+	}
+
+	retryableMethod := shouldRetryMethod(method, cfg.retryUnsafeMethods)
 
 	for attempt := 0; ; attempt++ {
 		req, reqErr := c.newRequest(ctx, method, targetURL, payload)
 		if reqErr != nil {
-			return reqErr
+			return nil, reqErr
 		}
 
 		resp, doErr := c.cfg.HTTPClient.Do(req)
 		if doErr != nil {
-			if attempt >= c.cfg.MaxRetries {
-				return fmt.Errorf("cloudflare request failed after retries: %w", doErr)
+			if !retryableMethod || attempt >= c.cfg.MaxRetries {
+				return nil, fmt.Errorf("cloudflare request failed after retries: %w", doErr)
 			}
 			delay := httpx.ExponentialBackoffDelay(
 				attempt,
 				c.cfg.RetryBaseDelay,
 				c.cfg.RetryMaxDelay,
 				true,
-				rand.Float64(),
+				secureRandomUnitFloat64(),
 			)
 			if sleepErr := httpx.SleepContext(ctx, delay); sleepErr != nil {
-				return sleepErr
+				return nil, sleepErr
 			}
 			continue
 		}
@@ -205,19 +278,19 @@ func (c *Client) Do(
 		bodyBytes, readErr := io.ReadAll(resp.Body)
 		_ = resp.Body.Close()
 		if readErr != nil {
-			return fmt.Errorf("read cloudflare response body: %w", readErr)
+			return nil, fmt.Errorf("read cloudflare response body: %w", readErr)
 		}
 
-		if shouldRetryStatus(resp.StatusCode) && attempt < c.cfg.MaxRetries {
+		if shouldRetryStatus(resp.StatusCode) && retryableMethod && attempt < c.cfg.MaxRetries {
 			delay := c.retryDelay(attempt, resp.Header.Get("Retry-After"))
 			if sleepErr := httpx.SleepContext(ctx, delay); sleepErr != nil {
-				return sleepErr
+				return nil, sleepErr
 			}
 			continue
 		}
 
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			return &HTTPStatusError{
+			return nil, &HTTPStatusError{
 				StatusCode: resp.StatusCode,
 				Body:       string(bodyBytes),
 			}
@@ -225,32 +298,46 @@ func (c *Client) Do(
 
 		var env envelope
 		if err := json.Unmarshal(bodyBytes, &env); err != nil {
-			return fmt.Errorf("decode cloudflare envelope: %w", err)
+			return nil, fmt.Errorf("decode cloudflare envelope: %w", err)
 		}
 
 		if !env.Success {
-			return fmt.Errorf("cloudflare API returned unsuccessful response: %s", formatAPIErrors(env.Errors))
+			return nil, fmt.Errorf("cloudflare API returned unsuccessful response: %s", formatAPIErrors(env.Errors))
 		}
 
-		if out == nil || len(env.Result) == 0 || string(env.Result) == "null" {
-			return nil
-		}
-
-		if err := json.Unmarshal(env.Result, out); err != nil {
-			return fmt.Errorf("decode cloudflare result: %w", err)
-		}
-
-		return nil
+		return &env, nil
 	}
 }
 
 // ListZones lists zones visible to the authenticated token.
 func (c *Client) ListZones(ctx context.Context) ([]Zone, error) {
-	var zones []Zone
-	if err := c.Do(ctx, http.MethodGet, "/zones", nil, nil, &zones); err != nil {
-		return nil, err
+	var allZones []Zone
+	page := 1
+
+	for {
+		params := url.Values{}
+		params.Set("page", strconv.Itoa(page))
+
+		env, err := c.doEnvelope(ctx, http.MethodGet, "/zones", params, nil)
+		if err != nil {
+			return nil, err
+		}
+
+		var pageZones []Zone
+		if len(env.Result) > 0 && string(env.Result) != "null" {
+			if err := json.Unmarshal(env.Result, &pageZones); err != nil {
+				return nil, fmt.Errorf("decode cloudflare zone list: %w", err)
+			}
+		}
+		allZones = append(allZones, pageZones...)
+
+		if env.ResultInfo == nil || env.ResultInfo.TotalPages <= page {
+			break
+		}
+		page++
 	}
-	return zones, nil
+
+	return allZones, nil
 }
 
 // ZoneIDByName resolves a zone name to its Cloudflare zone ID.
@@ -262,6 +349,7 @@ func (c *Client) ZoneIDByName(ctx context.Context, zoneName string) (string, err
 	var zones []Zone
 	params := url.Values{}
 	params.Set("name", zoneName)
+	params.Set("per_page", "1")
 
 	if err := c.Do(ctx, http.MethodGet, "/zones", params, nil, &zones); err != nil {
 		return "", err
@@ -318,8 +406,17 @@ func (c *Client) retryDelay(attempt int, retryAfterHeader string) time.Duration 
 		c.cfg.RetryBaseDelay,
 		c.cfg.RetryMaxDelay,
 		true,
-		rand.Float64(),
+		secureRandomUnitFloat64(),
 	)
+}
+
+func shouldRetryMethod(method string, retryUnsafe bool) bool {
+	switch strings.ToUpper(strings.TrimSpace(method)) {
+	case http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodTrace, http.MethodPut, http.MethodDelete:
+		return true
+	default:
+		return retryUnsafe
+	}
 }
 
 func shouldRetryStatus(statusCode int) bool {
@@ -367,6 +464,16 @@ func formatAPIErrors(items []APIErrorItem) string {
 		parts = append(parts, fmt.Sprintf("%d:%s", item.Code, item.Message))
 	}
 	return strings.Join(parts, ", ")
+}
+
+func secureRandomUnitFloat64() float64 {
+	var raw [8]byte
+	if _, err := crand.Read(raw[:]); err != nil {
+		return 0
+	}
+
+	value := binary.BigEndian.Uint64(raw[:]) >> 11
+	return float64(value) / float64(uint64(1)<<53)
 }
 
 func getenvInt(key string, fallback int) int {
